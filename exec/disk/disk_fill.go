@@ -67,6 +67,11 @@ func NewFillActionSpec() spec.ExpActionCommandSpec {
 					Desc:   "Whether to retain the big file handle, default value is false.",
 					NoArgs: true,
 				},
+				&spec.ExpFlag{
+					Name: "agressive",
+					Desc: "/////",
+					NoArgs: true,
+				},
 			},
 			ActionExecutor: &FillActionExecutor{},
 			ActionExample: `
@@ -114,6 +119,7 @@ func (*FillActionExecutor) Name() string {
 func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
 	directory := "/"
 	path := model.ActionFlags["path"]
+	agressive := model.ActionFlags["agressive"] == "true"
 	if path != "" {
 		directory = path
 	}
@@ -138,26 +144,26 @@ func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *spec
 					log.Errorf(ctx,"`%s`: size is illegal, it must be positive integer", size)
 					return spec.ResponseFailWithFlags(spec.ParameterIllegal, "size", size, "it must be positive integer")
 				}
-				return fae.start(uid, directory, size, percent, reserve, retainHandle, ctx)
+				return fae.start(uid, directory, size, percent, reserve, retainHandle, agressive, ctx)
 			}
 			_, err := strconv.Atoi(reserve)
 			if err != nil {
 				log.Errorf(ctx,"`%s`: reserve is illegal, it must be positive integer", reserve)
 				return spec.ResponseFailWithFlags(spec.ParameterIllegal, "reserve", reserve, "it must be positive integer")
 			}
-			return fae.start(uid, directory, "", percent, reserve, retainHandle, ctx)
+			return fae.start(uid, directory, "", percent, reserve, retainHandle, agressive, ctx)
 		}
 		_, err := strconv.Atoi(percent)
 		if err != nil {
 			log.Errorf(ctx,"`%s`: percent is illegal, it must be positive integer", percent)
 			return spec.ResponseFailWithFlags(spec.ParameterIllegal, "percent", percent, "it must be positive integer")
 		}
-		return fae.start(uid, directory, "", percent, "", retainHandle, ctx)
+		return fae.start(uid, directory, "", percent, "", retainHandle, agressive, ctx)
 	}
 }
 
-func (fae *FillActionExecutor) start(uid, directory, size, percent, reserve string, retainHandle bool, ctx context.Context) *spec.Response {
-	return startFill(ctx, uid, directory, size, percent, reserve, retainHandle, fae.channel)
+func (fae *FillActionExecutor) start(uid, directory, size, percent, reserve string, retainHandle bool, agressive bool, ctx context.Context) *spec.Response {
+	return startFill(ctx, uid, directory, size, percent, reserve, retainHandle, agressive, fae.channel)
 }
 
 func (fae *FillActionExecutor) stop(directory string, ctx context.Context) *spec.Response {
@@ -184,7 +190,7 @@ func retainFileHandle(ctx context.Context, cl spec.Channel, fillDiskDirectory st
 
 const diskFillErrorMessage = "No space left on device"
 
-func startFill(ctx context.Context, uid, directory, size, percent, reserve string, retainHandle bool, cl spec.Channel) *spec.Response {
+func startFill(ctx context.Context, uid, directory, size, percent, reserve string, retainHandle bool, agressive bool, cl spec.Channel) *spec.Response {
 
 	if directory == "" {
 		log.Errorf(ctx, "`%s`: directory is nil", directory)
@@ -200,26 +206,37 @@ func startFill(ctx context.Context, uid, directory, size, percent, reserve strin
 		return spec.ReturnFail(spec.OsCmdExecFailed, fmt.Sprintf("calculate size err, %v", err))
 	}
 	var response *spec.Response
-	// Some normal filesystems (ext4, xfs, btrfs and ocfs2) tack quick works
-	if cl.IsCommandAvailable(ctx, "fallocate") {
-		response = fillDiskByFallocate(ctx, size, dataFile, cl)
-	}
-	if response == nil || !response.Success {
-		// If execute fallocate command failed, use dd command to retry.
-		response = fillDiskByDD(ctx, dataFile, directory, size, cl)
-	}
-	if response.Success {
-		if retainHandle {
-			// start a process to hold the file handle
-			response := retainFileHandle(ctx, cl, directory)
-			if !response.Success {
-				return response
+
+	if !agressive || percent != "100" {
+		fmt.Println("none agressive")
+		// Some normal filesystems (ext4, xfs, btrfs and ocfs2) tack quick works
+		if cl.IsCommandAvailable(ctx, "fallocate") {
+			response = fillDiskByFallocate(ctx, size, dataFile, cl)
+		}
+		if response == nil || !response.Success {
+			// If execute fallocate command failed, use dd command to retry.
+			response = fillDiskByDD(ctx, dataFile, directory, size, cl)
+		}
+		if response.Success {
+			if retainHandle {
+				// start a process to hold the file handle
+				response := retainFileHandle(ctx, cl, directory)
+				if !response.Success {
+					return response
+				}
 			}
+			return response
+		}
+		if err = stopFill(ctx, directory, cl); err != nil {
+			log.Warnf(ctx, "failed to stop fill when starting failed, %v, starting err: %s", err, response.Err)
 		}
 		return response
 	}
-	if err = stopFill(ctx, directory, cl); err != nil {
-		log.Warnf(ctx, "failed to stop fill when starting failed, %v, starting err: %s", err, response.Err)
+
+	if agressive && percent == "100" {
+		fmt.Println("agressive")
+		response = fillDiskAgressive(ctx, dataFile, directory, cl)
+		return response
 	}
 	return response
 }
@@ -293,6 +310,39 @@ func fillDiskByDD(ctx context.Context, dataFile string, directory string, size s
 	}
 	return cl.Run(ctx, "nohup",
 		fmt.Sprintf(`dd if=/dev/zero of=%s bs=1M count=%s iflag=fullblock >/dev/null 2>&1 &`, dataFile, size))
+}
+
+func fillDiskAgressive(ctx context.Context, dataFile string, directory string, cl spec.Channel) *spec.Response {
+
+	if !cl.IsCommandAvailable(ctx, "fallocate") {
+		return spec.ResponseFailWithFlags(spec.CommandDdNotFound)
+	}
+	if !cl.IsCommandAvailable(ctx, "dd") {
+		return spec.ResponseFailWithFlags(spec.CommandDdNotFound)
+	}
+
+	stat := getSysStatFunc(directory)
+	availableBytes := float64(stat.Bavail * uint64(stat.Bsize))
+	availableKB := float64(availableBytes) / 1024.0
+	var shift float64 = 1
+	for i := 0; i < 21; i++ { // 21 round =~ 1gb
+		estimation := availableKB - shift
+		allocate := fmt.Sprintf("%.f", estimation)
+		x := fmt.Sprintf(`-l %sK %s`, allocate, dataFile)
+		//fmt.Println(x)
+		response := cl.Run(ctx, "fallocate", x)
+		//fmt.Println(response.Success)
+		if response.Success {
+			break
+		}
+		shift = shift * 2
+	}
+	ddstat := getSysStatFunc(directory)
+	ddavailableBytes := float64(ddstat.Bavail * uint64(ddstat.Bsize))
+	ddavailableKB := float64(ddavailableBytes) / 1024.0
+
+	return cl.Run(ctx, "nohup",
+	 	fmt.Sprintf(`dd if=/dev/zero of=%s bs=1K count=%v iflag=fullblock oflag=append conv=notrunc >/dev/null 2>&1 &`, dataFile, ddavailableKB))
 }
 
 // stopFill contains kill the filldisk process and delete the temp file actions
